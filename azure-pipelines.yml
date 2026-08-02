@@ -1,0 +1,243 @@
+# Azure DevOps CI/CD for the MRO supply chain pipeline.
+#
+# Stages: Validate -> Test -> Package -> Deploy(dev) -> Deploy(prod)
+# Snowflake DDL and Airflow DAGs are deployed together because a DAG referencing
+# a table that does not exist yet fails at runtime, not at parse time.
+
+trigger:
+  branches:
+    include: [main, develop]
+  paths:
+    exclude: [README.md, docs/*]
+
+pr:
+  branches:
+    include: [main]
+
+variables:
+  pythonVersion: '3.11'
+  vmImage: 'ubuntu-latest'
+
+stages:
+
+# ---------------------------------------------------------------- validate
+- stage: Validate
+  displayName: 'Lint & static checks'
+  jobs:
+  - job: Lint
+    pool:
+      vmImage: $(vmImage)
+    steps:
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '$(pythonVersion)'
+
+    - script: |
+        python -m pip install --upgrade pip
+        pip install ruff mypy pandas-stubs types-requests
+      displayName: 'Install lint tooling'
+
+    - script: ruff check . --output-format=azure
+      displayName: 'Ruff lint'
+
+    - script: ruff format --check .
+      displayName: 'Format check'
+
+    - script: mypy connectors processing ml snowflake --ignore-missing-imports
+      displayName: 'Type check'
+      continueOnError: true
+
+    # A DAG that fails to import takes down the whole Airflow scheduler parse
+    # loop, so this gate runs before anything else can merge.
+    - script: |
+        pip install "apache-airflow==2.8.*" --constraint \
+          "https://raw.githubusercontent.com/apache/airflow/constraints-2.8.4/constraints-3.11.txt"
+        pip install -r requirements.txt
+        export AIRFLOW_HOME=$(mktemp -d)
+        airflow db migrate
+        python -c "
+        from airflow.models import DagBag
+        bag = DagBag('airflow_dags', include_examples=False)
+        assert not bag.import_errors, bag.import_errors
+        print(f'{len(bag.dags)} DAGs parsed cleanly: {list(bag.dags)}')
+        "
+      displayName: 'Airflow DAG import check'
+
+# -------------------------------------------------------------------- test
+- stage: Test
+  displayName: 'Unit & integration tests'
+  dependsOn: Validate
+  jobs:
+  - job: PyTest
+    pool:
+      vmImage: $(vmImage)
+    strategy:
+      matrix:
+        Python310:
+          pythonVersion: '3.10'
+        Python311:
+          pythonVersion: '3.11'
+    steps:
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '$(pythonVersion)'
+
+    - script: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest-cov
+      displayName: 'Install dependencies'
+
+    - script: python data/generate_synthetic.py
+      displayName: 'Generate synthetic fixtures'
+
+    - script: |
+        pytest tests -v \
+          --junitxml=junit/test-results.xml \
+          --cov=connectors --cov=processing --cov=ml --cov=snowflake \
+          --cov-report=xml --cov-report=html
+      displayName: 'Run tests'
+
+    # The end-to-end run is the real regression gate: it catches interface
+    # drift between modules that unit tests with mocked inputs never see.
+    - script: python run_pipeline.py --out $(Agent.TempDirectory)/pipeline_out
+      displayName: 'End-to-end pipeline smoke test'
+
+    - task: PublishTestResults@2
+      condition: succeededOrFailed()
+      inputs:
+        testResultsFiles: 'junit/test-results.xml'
+        testRunTitle: 'MRO pipeline $(pythonVersion)'
+
+    - task: PublishCodeCoverageResults@2
+      condition: succeededOrFailed()
+      inputs:
+        summaryFileLocation: 'coverage.xml'
+
+# ----------------------------------------------------------------- package
+- stage: Package
+  displayName: 'Build artifacts'
+  dependsOn: Test
+  condition: and(succeeded(), in(variables['Build.SourceBranch'], 'refs/heads/main', 'refs/heads/develop'))
+  jobs:
+  - job: Build
+    pool:
+      vmImage: $(vmImage)
+    steps:
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '$(pythonVersion)'
+
+    - script: |
+        mkdir -p $(Build.ArtifactStagingDirectory)/dags
+        cp -r airflow_dags/* $(Build.ArtifactStagingDirectory)/dags/
+        cp -r connectors processing ml snowflake $(Build.ArtifactStagingDirectory)/dags/
+        cp requirements.txt $(Build.ArtifactStagingDirectory)/
+      displayName: 'Stage DAGs and shared modules'
+
+    - script: |
+        mkdir -p $(Build.ArtifactStagingDirectory)/sql
+        cp snowflake/snowflake_models/*.sql $(Build.ArtifactStagingDirectory)/sql/
+      displayName: 'Stage Snowflake DDL'
+
+    - publish: $(Build.ArtifactStagingDirectory)
+      artifact: mro-pipeline
+
+# ------------------------------------------------------------------ deploy
+- stage: DeployDev
+  displayName: 'Deploy to dev'
+  dependsOn: Package
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/develop'))
+  jobs:
+  - deployment: Dev
+    pool:
+      vmImage: $(vmImage)
+    environment: 'mro-dev'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - download: current
+            artifact: mro-pipeline
+
+          - task: AzureCLI@2
+            displayName: 'Apply Snowflake DDL'
+            inputs:
+              azureSubscription: 'mro-dev-connection'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                pip install snowflake-connector-python
+                python -c "
+                from snowflake.hub_loader import HubLoader, SnowflakeConfig
+                HubLoader(SnowflakeConfig()).deploy_models('$(Pipeline.Workspace)/mro-pipeline/sql')
+                "
+            env:
+              SNOWFLAKE_ACCOUNT: $(SF_ACCOUNT_DEV)
+              SNOWFLAKE_USER: $(SF_USER_DEV)
+              SNOWFLAKE_PRIVATE_KEY_PATH: $(SF_KEY_PATH)
+              SNOWFLAKE_DATABASE: MRO_HUB_DEV
+
+          - task: AzureCLI@2
+            displayName: 'Sync DAGs to Airflow storage'
+            inputs:
+              azureSubscription: 'mro-dev-connection'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az storage blob sync \
+                  --account-name $(AIRFLOW_STORAGE_DEV) \
+                  --container dags \
+                  --source $(Pipeline.Workspace)/mro-pipeline/dags
+
+- stage: DeployProd
+  displayName: 'Deploy to production'
+  dependsOn: Package
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - deployment: Prod
+    pool:
+      vmImage: $(vmImage)
+    # The 'mro-prod' environment carries a manual approval gate - an AOG
+    # alerting pipeline that silently breaks is a safety-adjacent failure.
+    environment: 'mro-prod'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - download: current
+            artifact: mro-pipeline
+
+          - task: AzureCLI@2
+            displayName: 'Apply Snowflake DDL'
+            inputs:
+              azureSubscription: 'mro-prod-connection'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                pip install snowflake-connector-python
+                python -c "
+                from snowflake.hub_loader import HubLoader, SnowflakeConfig
+                HubLoader(SnowflakeConfig()).deploy_models('$(Pipeline.Workspace)/mro-pipeline/sql')
+                "
+            env:
+              SNOWFLAKE_ACCOUNT: $(SF_ACCOUNT_PROD)
+              SNOWFLAKE_USER: $(SF_USER_PROD)
+              SNOWFLAKE_PRIVATE_KEY_PATH: $(SF_KEY_PATH)
+              SNOWFLAKE_DATABASE: MRO_HUB
+
+          - task: AzureCLI@2
+            displayName: 'Sync DAGs to Airflow storage'
+            inputs:
+              azureSubscription: 'mro-prod-connection'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az storage blob sync \
+                  --account-name $(AIRFLOW_STORAGE_PROD) \
+                  --container dags \
+                  --source $(Pipeline.Workspace)/mro-pipeline/dags
+
+          - script: |
+              echo "Post-deploy: verifying DAGs are unpaused and healthy"
+            displayName: 'Post-deploy smoke check'

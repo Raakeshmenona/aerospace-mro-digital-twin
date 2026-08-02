@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+coverage.xml
+junit/
+*.egg-info/
+.venv/
+venv/
+
+# Generated locally by data/generate_synthetic.py
+data/sample/
+# Pipeline outputs and trained models
+out/
+*.pkl
+
+# Never commit credentials
+.env
+*.p8
+*.pem
